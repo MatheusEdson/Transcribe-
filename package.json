@@ -1,0 +1,16 @@
+{
+  "name": "transcribe",
+  "version": "2.0.0",
+  "description": "MP4 → MP3 → TXT com rastreio de origem via Whisper + ffmpeg",
+  "scripts": {
+    "setup": "pip install -r requirements.txt",
+    "setup:ffmpeg": "winget install Gyan.FFmpeg --silent --accept-package-agreements --accept-source-agreements",
+    "transcribe": "python transcribe.py",
+    "transcribe:mp3": "python transcribe.py --mp3-only",
+    "transcribe:fast": "python transcribe.py --model tiny",
+    "manifest": "node -e \"const m=require('./output/manifest.json'); m.entries.forEach(e => console.log(e.source_file, '|', e.word_count ?? '-', 'palavras'))\""
+  },
+  "keywords": ["mp4", "mp3", "transcription", "whisper", "ffmpeg", "speech-to-text"],
+  "author": "Matheus Linhares",
+  "license": "MIT"
+}

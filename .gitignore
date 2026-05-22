@@ -1,0 +1,12 @@
+*.mp3
+*.mp4
+*.wav
+*.pdf
+output/
+node_modules/
+__pycache__/
+*.pyc
+.env
+# ignorar transcricoes geradas, nao arquivos de config
+transcripts/
+!requirements.txt
