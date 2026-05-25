@@ -7,6 +7,17 @@ node_modules/
 __pycache__/
 *.pyc
 .env
-# ignorar transcricoes geradas, nao arquivos de config
+
+# transcricoes geradas
 transcripts/
+
+# Mac artifacts — nunca commitar
+.DS_Store
+**/.DS_Store
+
+# Dados sensíveis — nunca commitar
+database/*.sqlite
+dados_drive_sim/
+config/credentials.json
+
 !requirements.txt
