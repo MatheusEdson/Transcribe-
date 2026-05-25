@@ -1,17 +1,15 @@
 """
-transcribe — MP4 → MP3 → TXT (Escalado para Pipeline de Segmentos + SQLite)
+transcribe — MP4 → MP3 → TXT (Escalado para Pipeline de Segmentos + SQLite + Drive URL)
 
 Fluxo:
     1. Varre pastas e subpastas buscando MP4.
-    2. Consulta o Banco de Dados SQLite para resgatar Metadados (Segmento, URL, Dúvidas, etc).
-    3. Copia o MP4 para a pasta do respectivo segmento.
-    4. Extrai audio do video (MP4 → MP3) via ffmpeg.
-    5. Transcreve o audio com Whisper (local, offline).
-    6. Salva transcricao em .txt com todos os metadados do banco injetados no Header.
-    7. Registra origem em manifest.json central.
-
-Uso:
-    python3 transcribe.py pasta_principal/ --db banco.sqlite
+    2. Consulta SQLite para resgatar Metadados (Segmento, Dúvidas, etc).
+    3. Recebe a URL oficial do Drive via argumento.
+    4. Copia o MP4 para a pasta do respectivo segmento.
+    5. Extrai audio do video (MP4 → MP3) via ffmpeg.
+    6. Transcreve o audio com Whisper (local, offline).
+    7. Salva transcricao em .txt com Header completo (URL do Drive + SQLite).
+    8. Registra origem e URL no manifest.json central.
 """
 
 import argparse
@@ -50,11 +48,8 @@ def normalize_string(text: str) -> str:
 
 
 def get_metadata_from_db(db_path: Path, video_filename: str) -> dict:
-    """
-    Conecta ao banco SQLite, varre as tabelas e busca a linha 
-    que corresponde ao arquivo de vídeo para extrair os metadados.
-    """
     if not db_path.exists():
+        print(f"  [Aviso] Banco de dados não encontrado em: {db_path}")
         return None
         
     video_stem = normalize_string(Path(video_filename).stem)
@@ -72,14 +67,13 @@ def get_metadata_from_db(db_path: Path, video_filename: str) -> dict:
             rows = cursor.fetchall()
             for row in rows:
                 row_dict = dict(row)
-                # Busca flexível: olha todas as colunas procurando o nome do vídeo
                 for key, value in row_dict.items():
                     if value and isinstance(value, str):
                         if video_stem in normalize_string(value):
                             return row_dict
         return None
     except Exception as e:
-        print(f"  [Aviso] Falha ao ler o banco de dados: {e}")
+        print(f"  [Erro] Falha ao ler o banco de dados SQLite: {e}")
         return None
     finally:
         if 'conn' in locals():
@@ -131,47 +125,41 @@ def save_manifest(manifest: dict, output_dir: Path):
 
 
 def process_file(mp4_path: Path, base_output_dir: Path, input_root: Path, args) -> dict:
-    
     # 1. Consulta Metadados no Banco SQLite
     metadata = None
     if args.db:
         db_p = Path(args.db)
         metadata = get_metadata_from_db(db_p, mp4_path.name)
 
-    # 2. Definição do Segmento e URL baseados no BD
+    # 2. Definição do Segmento
     segment_name = None
-    video_link = "URL NÃO ENCONTRADA NO BANCO DE DADOS"
-    
     if metadata:
         for k, v in metadata.items():
             k_lower = k.lower()
             if "segmento" in k_lower and v:
                 segment_name = str(v).strip()
-            elif "link" in k_lower and v:
-                video_link = str(v).strip()
     
-    # Fallback se o banco não retornar o segmento
     if not segment_name:
         segment_name = mp4_path.parent.name if mp4_path.parent != input_root else "geral"
 
-    # Cria a pasta do segmento (Ex: output/maquinas/)
     segment_output_dir = base_output_dir / segment_name
     segment_output_dir.mkdir(parents=True, exist_ok=True)
     
-    # 3. Copia o vídeo para a pasta final (Estrutura: Vídeo + TXT)
+    # 3. Copia o vídeo para a pasta final
     final_mp4_path = segment_output_dir / mp4_path.name
     if not final_mp4_path.exists():
         print(f"  Copiando vídeo para estrutura final: {final_mp4_path.name}")
         shutil.copy2(mp4_path, final_mp4_path)
 
+    # 4. Rastreio no Manifest com o webViewLink do Drive
     entry = {
         "source_file": mp4_path.name,
         "segment": segment_name,
+        "drive_url": args.drive_url if args.drive_url else "LOCAL",
         "database_match": bool(metadata),
         "processed_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    # 4. Extrai MP3 para a pasta do segmento
     if not args.skip_extract:
         mp3_path = extract_audio(final_mp4_path, segment_output_dir)
     else:
@@ -184,7 +172,6 @@ def process_file(mp4_path: Path, base_output_dir: Path, input_root: Path, args) 
     if args.mp3_only:
         return entry
 
-    # 5. Transcreve e aplica regra de negócio (Injeção de Metadados no Header)
     txt_path = segment_output_dir / (mp4_path.stem + ".txt")
     if txt_path.exists():
         print(f"  TXT existente: {txt_path.name}")
@@ -193,19 +180,20 @@ def process_file(mp4_path: Path, base_output_dir: Path, input_root: Path, args) 
     else:
         raw_text = transcribe_audio(mp3_path, args.model, args.lang)
         
+        # Montagem Estruturada do Cabeçalho com o Link do Drive solicitado pelo Matheus
         header_lines = [
-            f"URL DO VÍDEO: {video_link}",
+            f"LINK OFICIAL DO GOOGLE DRIVE: {args.drive_url if args.drive_url else 'Não fornecido'}",
             "-" * 60
         ]
         
         if metadata:
-            header_lines.append("METADADOS DO ROTEIRO (BLIPS EDUCA):")
+            header_lines.append("METADADOS (BLIPS EDUCA - SQLITE):")
             for k, v in metadata.items():
                 if v and str(v).strip() != "":
                     header_lines.append(f"{str(k).upper()}: {v}")
             header_lines.append("-" * 60)
         else:
-            header_lines.append("ALERTA: Vídeo não localizado no Banco de Dados.")
+            header_lines.append("ALERTA: Vídeo não localizado no Banco de Dados SQLite.")
             header_lines.append("-" * 60)
             
         formatted_text = "\n".join(header_lines) + "\n\n"
@@ -223,19 +211,15 @@ def process_file(mp4_path: Path, base_output_dir: Path, input_root: Path, args) 
 
 
 def main():
-    parser = argparse.ArgumentParser(description="MP4 → MP3 → TXT integrado com SQLite")
+    parser = argparse.ArgumentParser(description="MP4 → MP3 → TXT integrado com SQLite e Google Drive API")
     parser.add_argument("input", help="Arquivo MP4 ou pasta base com MP4s")
     parser.add_argument("--output", "-o", default="output", help="Pasta de saida principal")
     parser.add_argument("--db", default=None, help="Caminho para o arquivo de banco de dados SQLite (.sqlite)")
-    parser.add_argument("--model", "-m", default="small",
-                        choices=["tiny", "base", "small", "medium", "large"],
-                        help="Modelo Whisper (default: small)")
-    parser.add_argument("--lang", default="pt",
-                        help="Idioma para Whisper (default: pt). Use 'None' para auto")
-    parser.add_argument("--mp3-only", action="store_true",
-                        help="Apenas extrai MP3, sem transcrever")
-    parser.add_argument("--skip-extract", action="store_true",
-                        help="Pula extracao, usa MP3 existente")
+    parser.add_argument("--drive-url", default=None, help="Link oficial webViewLink vindo da API do Google Drive")
+    parser.add_argument("--model", "-m", default="small", choices=["tiny", "base", "small", "medium", "large"])
+    parser.add_argument("--lang", default="pt")
+    parser.add_argument("--mp3-only", action="store_true")
+    parser.add_argument("--skip-extract", action="store_true")
     args = parser.parse_args()
 
     if not check_ffmpeg():
@@ -261,7 +245,7 @@ def main():
         print(f"Arquivo/pasta nao encontrado: {input_path}")
         sys.exit(1)
 
-    print(f"Iniciando pipeline Integrado... Processando {len(mp4_files)} arquivo(s)")
+    print(f"Iniciando pipeline... Processando {len(mp4_files)} arquivo(s)")
 
     manifest = load_manifest(output_dir)
     existing = {e["source_file"] for e in manifest["entries"]}
@@ -276,7 +260,7 @@ def main():
         manifest["entries"].append(entry)
         save_manifest(manifest, output_dir)
 
-    print(f"\nOperação Concluida. Manifest central: {output_dir / MANIFEST_FILE}")
+    print(f"\nOperação Concluída. Manifest central: {output_dir / MANIFEST_FILE}")
 
 
 if __name__ == "__main__":
