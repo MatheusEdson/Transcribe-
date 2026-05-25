@@ -1,27 +1,24 @@
 """
-transcribe — MP4 → MP3 → TXT
+transcribe — MP4 → MP3 → TXT (Escalado para Pipeline de Segmentos + SQLite + Drive URL)
 
 Fluxo:
-    1. Extrai audio do video (MP4 → MP3) via ffmpeg
-    2. Transcreve o audio com Whisper (local, gratuito)
-    3. Salva transcricao em .txt e registra origem em manifest.json
-
-Uso:
-    python transcribe.py <arquivo.mp4> [opcoes]
-    python transcribe.py pasta/  # processa todos os MP4 da pasta
-
-Opcoes:
-    --output, -o     Pasta de saida (default: ./output)
-    --model, -m      Modelo Whisper: tiny|base|small|medium|large (default: small)
-    --lang           Idioma (default: pt). Use None para auto-detectar
-    --mp3-only       Apenas extrai o MP3, sem transcrever
-    --skip-extract   Usa MP3 ja existente na pasta de saida
+    1. Varre pastas e subpastas buscando MP4.
+    2. Consulta SQLite para resgatar Metadados (Segmento, Dúvidas, etc).
+    3. Recebe a URL oficial do Drive via argumento.
+    4. Copia o MP4 para a pasta do respectivo segmento.
+    5. Extrai audio do video (MP4 → MP3) via ffmpeg.
+    6. Transcreve o audio com Whisper (local, offline).
+    7. Salva transcricao em .txt com Header completo (URL do Drive + SQLite).
+    8. Registra origem e URL no manifest.json central.
 """
 
 import argparse
 import json
 import subprocess
 import sys
+import sqlite3
+import shutil
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -43,6 +40,44 @@ def check_whisper():
         return True
     except ImportError:
         return False
+
+
+def normalize_string(text: str) -> str:
+    """Normaliza strings removendo caracteres especiais e espaços para cruzamento de dados."""
+    return re.sub(r'[^a-zA-Z0-9]', '', str(text)).lower()
+
+
+def get_metadata_from_db(db_path: Path, video_filename: str) -> dict:
+    if not db_path.exists():
+        print(f"  [Aviso] Banco de dados não encontrado em: {db_path}")
+        return None
+        
+    video_stem = normalize_string(Path(video_filename).stem)
+    
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        tables = [t["name"] for t in cursor.fetchall()]
+        
+        for t_name in tables:
+            cursor.execute(f"SELECT * FROM `{t_name}`")
+            rows = cursor.fetchall()
+            for row in rows:
+                row_dict = dict(row)
+                for key, value in row_dict.items():
+                    if value and isinstance(value, str):
+                        if video_stem in normalize_string(value):
+                            return row_dict
+        return None
+    except Exception as e:
+        print(f"  [Erro] Falha ao ler o banco de dados SQLite: {e}")
+        return None
+    finally:
+        if 'conn' in locals():
+            conn.close()
 
 
 def extract_audio(mp4_path: Path, output_dir: Path) -> Path:
@@ -89,82 +124,120 @@ def save_manifest(manifest: dict, output_dir: Path):
     path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def process_file(mp4_path: Path, output_dir: Path, args) -> dict:
-    output_dir.mkdir(parents=True, exist_ok=True)
+def process_file(mp4_path: Path, base_output_dir: Path, input_root: Path, args) -> dict:
+    # 1. Consulta Metadados no Banco SQLite
+    metadata = None
+    if args.db:
+        db_p = Path(args.db)
+        metadata = get_metadata_from_db(db_p, mp4_path.name)
+
+    # 2. Definição do Segmento
+    segment_name = None
+    if metadata:
+        for k, v in metadata.items():
+            k_lower = k.lower()
+            if "segmento" in k_lower and v:
+                segment_name = str(v).strip()
+    
+    if not segment_name:
+        segment_name = mp4_path.parent.name if mp4_path.parent != input_root else "geral"
+
+    segment_output_dir = base_output_dir / segment_name
+    segment_output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 3. Copia o vídeo para a pasta final
+    final_mp4_path = segment_output_dir / mp4_path.name
+    if not final_mp4_path.exists():
+        print(f"  Copiando vídeo para estrutura final: {final_mp4_path.name}")
+        shutil.copy2(mp4_path, final_mp4_path)
+
+    # 4. Rastreio no Manifest com o webViewLink do Drive
     entry = {
         "source_file": mp4_path.name,
-        "source_path": str(mp4_path.resolve()),
+        "segment": segment_name,
+        "drive_url": args.drive_url if args.drive_url else "LOCAL",
+        "database_match": bool(metadata),
         "processed_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    # Extrai MP3
     if not args.skip_extract:
-        mp3_path = extract_audio(mp4_path, output_dir)
+        mp3_path = extract_audio(final_mp4_path, segment_output_dir)
     else:
-        mp3_path = output_dir / (mp4_path.stem + ".mp3")
+        mp3_path = segment_output_dir / (mp4_path.stem + ".mp3")
         if not mp3_path.exists():
-            print(f"  MP3 nao encontrado em {mp3_path}, extraindo...")
-            mp3_path = extract_audio(mp4_path, output_dir)
+            mp3_path = extract_audio(final_mp4_path, segment_output_dir)
 
     entry["mp3_file"] = mp3_path.name
-    entry["mp3_size_mb"] = round(mp3_path.stat().st_size / 1024 / 1024, 2)
 
     if args.mp3_only:
         return entry
 
-    # Transcreve
-    txt_path = output_dir / (mp4_path.stem + ".txt")
+    txt_path = segment_output_dir / (mp4_path.stem + ".txt")
     if txt_path.exists():
         print(f"  TXT existente: {txt_path.name}")
-        text = txt_path.read_text(encoding="utf-8")
+        text_content = txt_path.read_text(encoding="utf-8")
+        word_count = len(text_content.split())
     else:
-        text = transcribe_audio(mp3_path, args.model, args.lang)
-        txt_path.write_text(text, encoding="utf-8")
-        print(f"  TXT salvo: {txt_path.name} ({len(text.split()):,} palavras)")
+        raw_text = transcribe_audio(mp3_path, args.model, args.lang)
+        
+        # Montagem Estruturada do Cabeçalho com o Link do Drive solicitado pelo Matheus
+        header_lines = [
+            f"LINK OFICIAL DO GOOGLE DRIVE: {args.drive_url if args.drive_url else 'Não fornecido'}",
+            "-" * 60
+        ]
+        
+        if metadata:
+            header_lines.append("METADADOS (BLIPS EDUCA - SQLITE):")
+            for k, v in metadata.items():
+                if v and str(v).strip() != "":
+                    header_lines.append(f"{str(k).upper()}: {v}")
+            header_lines.append("-" * 60)
+        else:
+            header_lines.append("ALERTA: Vídeo não localizado no Banco de Dados SQLite.")
+            header_lines.append("-" * 60)
+            
+        formatted_text = "\n".join(header_lines) + "\n\n"
+        formatted_text += "TRANSCRIÇÃO OFICIAL:\n"
+        formatted_text += raw_text
+        
+        txt_path.write_text(formatted_text, encoding="utf-8")
+        word_count = len(raw_text.split())
+        print(f"  TXT salvo: {txt_path.name} ({word_count:,} palavras) no segmento [{segment_name}]")
 
     entry["txt_file"] = txt_path.name
-    entry["word_count"] = len(text.split())
-    entry["preview"] = text[:200]
+    entry["word_count"] = word_count
 
     return entry
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="MP4 → MP3 → TXT com rastreio de origem"
-    )
-    parser.add_argument("input", help="Arquivo MP4 ou pasta com MP4s")
-    parser.add_argument("--output", "-o", default="output", help="Pasta de saida")
-    parser.add_argument("--model", "-m", default="small",
-                        choices=["tiny", "base", "small", "medium", "large"],
-                        help="Modelo Whisper (default: small)")
-    parser.add_argument("--lang", default="pt",
-                        help="Idioma para Whisper (default: pt). Use 'None' para auto")
-    parser.add_argument("--mp3-only", action="store_true",
-                        help="Apenas extrai MP3, sem transcrever")
-    parser.add_argument("--skip-extract", action="store_true",
-                        help="Pula extracao, usa MP3 existente")
+    parser = argparse.ArgumentParser(description="MP4 → MP3 → TXT integrado com SQLite e Google Drive API")
+    parser.add_argument("input", help="Arquivo MP4 ou pasta base com MP4s")
+    parser.add_argument("--output", "-o", default="output", help="Pasta de saida principal")
+    parser.add_argument("--db", default=None, help="Caminho para o arquivo de banco de dados SQLite (.sqlite)")
+    parser.add_argument("--drive-url", default=None, help="Link oficial webViewLink vindo da API do Google Drive")
+    parser.add_argument("--model", "-m", default="small", choices=["tiny", "base", "small", "medium", "large"])
+    parser.add_argument("--lang", default="pt")
+    parser.add_argument("--mp3-only", action="store_true")
+    parser.add_argument("--skip-extract", action="store_true")
     args = parser.parse_args()
 
-    # Validacoes
     if not check_ffmpeg():
         print("Erro: ffmpeg nao encontrado.")
-        print("Instale: winget install Gyan.FFmpeg")
         sys.exit(1)
 
     if not args.mp3_only and not check_whisper():
         print("Erro: whisper nao instalado.")
-        print("Instale: pip install openai-whisper")
         sys.exit(1)
 
     input_path = Path(args.input)
     output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Coleta arquivos a processar
     if input_path.is_dir():
-        mp4_files = sorted(input_path.glob("*.mp4"))
+        mp4_files = sorted([f for f in input_path.rglob("*") if f.suffix.lower() == ".mp4"])
         if not mp4_files:
-            print(f"Nenhum MP4 encontrado em {input_path}")
+            print(f"Nenhum MP4 encontrado em {input_path} ou subpastas.")
             sys.exit(1)
     elif input_path.is_file():
         mp4_files = [input_path]
@@ -172,22 +245,22 @@ def main():
         print(f"Arquivo/pasta nao encontrado: {input_path}")
         sys.exit(1)
 
-    print(f"Processando {len(mp4_files)} arquivo(s) → {output_dir}/")
+    print(f"Iniciando pipeline... Processando {len(mp4_files)} arquivo(s)")
 
     manifest = load_manifest(output_dir)
     existing = {e["source_file"] for e in manifest["entries"]}
 
     for mp4 in mp4_files:
-        print(f"\n[{mp4.name}]")
+        print(f"\n[Mídia: {mp4.name}]")
         if mp4.name in existing and not args.mp3_only:
             print("  Ja processado (manifest.json). Pulando.")
             continue
 
-        entry = process_file(mp4, output_dir, args)
+        entry = process_file(mp4, output_dir, input_path, args)
         manifest["entries"].append(entry)
         save_manifest(manifest, output_dir)
 
-    print(f"\nConcluido. Manifest: {output_dir / MANIFEST_FILE}")
+    print(f"\nOperação Concluída. Manifest central: {output_dir / MANIFEST_FILE}")
 
 
 if __name__ == "__main__":
